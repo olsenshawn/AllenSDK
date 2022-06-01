@@ -1,6 +1,9 @@
 import pytest
 import pathlib
 import copy
+import json
+import pandas as pd
+import tempfile
 
 from allensdk.brain_observatory.vbn_2022.metadata_writer \
     .metadata_writer import VBN2022MetadataWriterClass
@@ -20,12 +23,15 @@ def test_metadata_writer_smoketest(
     """
 
     output_names = ('units.csv', 'probes.csv', 'channels.csv',
-                    'sessions.csv', 'behavior_sessions.csv')
+                    'ecephys_sessions.csv', 'behavior_sessions.csv')
 
     config = copy.deepcopy(smoketest_config_fixture)
 
     output_dir = tmp_path_factory.mktemp('vbn_metadata_smoketest')
     output_dir = pathlib.Path(output_dir)
+    output_json_path = pathlib.Path(
+                           tempfile.mkstemp(dir=output_dir,
+                                            suffix='.json')[1])
     config['output_dir'] = str(output_dir.resolve().absolute())
 
     expected_paths = []
@@ -41,12 +47,24 @@ def test_metadata_writer_smoketest(
     config['ecephys_nwb_dir'] = this_dir
     config['clobber'] = False
     config['on_missing_file'] = on_missing_file
+    config['output_json'] = str(output_json_path.resolve().absolute())
 
     writer = VBN2022MetadataWriterClass(args=[], input_data=config)
     writer.run()
 
+    # load a dict mapping the name of a metadata.csv
+    # to the list of columns it is supposed to contain
+    this_dir = pathlib.Path(__file__).parent
+    resource_dir = this_dir / 'resources'
+    with open(resource_dir / 'column_lookup.json', 'rb') as in_file:
+        column_lookup = json.load(in_file)
+
     for file_path in expected_paths:
         assert file_path.exists()
+        df = pd.read_csv(file_path)
+        expected_columns = set(column_lookup[file_path.name])
+        actual_columns = set(df.columns)
+        assert expected_columns == actual_columns
 
     helper_functions.windows_safe_cleanup_dir(
         dir_path=output_dir)

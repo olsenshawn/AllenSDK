@@ -1,30 +1,11 @@
 import argschema
+from argschema.schemas import DefaultSchema
 import pathlib
-import re
 from marshmallow import post_load
 from marshmallow.validate import OneOf
 
-
-class ProbeToSkip(argschema.ArgSchema):
-
-    session = argschema.fields.Int(
-            required=True,
-            description=("The ecephys_session_id associated with "
-                         "the bad probe"))
-
-    probe = argschema.fields.Str(
-            required=True,
-            description=("The name of the bad probe, e.g. 'probeA'"))
-
-    @post_load
-    def validate_probe_names(self, data, **kwargs):
-        pattern = re.compile('probe[A-Z]')
-        match = pattern.match(data['probe'])
-        if match is None or len(data['probe']) != 6:
-            raise ValueError(
-                f"{data['probe']} is not a valid probe name; "
-                "must be like 'probe[A-Z]'")
-        return data
+from allensdk.brain_observatory.vbn_2022.utils.schemas import (
+    ProbeToSkip)
 
 
 class VBN2022MetadataWriterInputSchema(argschema.ArgSchema):
@@ -84,7 +65,7 @@ class VBN2022MetadataWriterInputSchema(argschema.ArgSchema):
         fname_lookup = {'units_path': 'units.csv',
                         'channels_path': 'channels.csv',
                         'probes_path': 'probes.csv',
-                        'ecephys_sessions_path': 'sessions.csv',
+                        'ecephys_sessions_path': 'ecephys_sessions.csv',
                         'behavior_sessions_path': 'behavior_sessions.csv'}
 
         out_dir = pathlib.Path(data['output_dir'])
@@ -101,3 +82,56 @@ class VBN2022MetadataWriterInputSchema(argschema.ArgSchema):
                 f"{msg}"
                 "Run with clobber=True if you want to overwrite")
         return data
+
+
+class PipelineMetadataSchema(DefaultSchema):
+
+    name = argschema.fields.Str(
+            required=True,
+            allow_none=False,
+            description=(
+                "Name of the pipeline component (e.g. 'AllenSDK')"))
+
+    version = argschema.fields.Str(
+            required=True,
+            allow_none=False,
+            description=(
+                "Semantic version of the pipeline component"))
+
+    comment = argschema.fields.Str(
+            required=False,
+            default="",
+            description=(
+                "Optional comment about this piece of software"))
+
+
+class DataReleaseToolsInputSchema(argschema.ArgSchema):
+    """
+    This schema will be used as the output schema for
+    data_release.metadata_writer modules. It is actually
+    a subset of the input schema for the
+    informatics_data_release_tools (the output of the metadata
+    writers is meant to be the input of the data_release_tool)
+    """
+
+    metadata_files = argschema.fields.List(
+            argschema.fields.InputFile,
+            description=(
+                "Paths to the metadata .csv files "
+                "written by this modules"))
+
+    data_pipeline_metadata = argschema.fields.Nested(
+            PipelineMetadataSchema,
+            many=True,
+            description=(
+                "Metadata about the pipeline used "
+                "to create this data release"))
+
+    project_name = argschema.fields.Str(
+            required=True,
+            default=None,
+            allow_none=False,
+            description=(
+                "The project name to be passed along "
+                "to the data_release_tool when uploading "
+                "this dataset"))

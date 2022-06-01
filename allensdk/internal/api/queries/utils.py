@@ -4,30 +4,54 @@ from uuid import UUID
 
 
 def build_in_list_selector_query(
-        col,
-        valid_list: Optional[SupportsStr] = None,
-        operator: str = "WHERE") -> str:
+        col: str,
+        valid_list: Optional[List[SupportsStr]] = None,
+        operator: str = "WHERE",
+        valid: bool = True) -> str:
     """
-    Filter for rows where the value of a column is contained in a list.
+    Filter for rows where the value of a column is contained in a list
+    (or, if valid=False, where the value is not contained in that list).
     If no list is specified in `valid_list`, return an empty string.
 
-    NOTE: if string ids are used, then the strings in `valid_list` must
-    be enclosed in single quotes, or else the query will throw a column
-    does not exist error. E.g. ["'mystringid1'", "'mystringid2'"...]
+    Parameters
+    ----------
+    col: str
+        The name of the column being filtered on
 
-    :param col: name of column to compare if in a list
-    :type col: str
-    :param valid_list: iterable of values that can be mapped to str
-        (e.g. string, int, float).
-    :type valid_list: list
-    :param operator: SQL operator to start the clause. Default="WHERE".
-        Valid inputs: "AND", "OR", "WHERE" (not case-sensitive).
-    :type operator: str
+    valid_list: Optional[SupportsStr]
+        The list of values to test column on
+
+    operator: str
+        The SQL operator that starts the clause ("WHERE", "AND" or "OR")
+
+    valid: bool
+        If True, test for "col IN valid_list"; else, test for
+        "col NOT IN valid_list"
+
+    Returns
+    -------
+    session_query: str
+        The clause performing the request filter
     """
+    if operator not in ("AND", "OR", "WHERE"):
+        msg = ("Operator must be 'AND', 'OR', or 'WHERE'; "
+               f"you gave '{operator}'")
+        raise ValueError(msg)
+
     if not valid_list:
         return ""
+
+    if type(valid_list[0]) is str:
+        valid_list = _convert_list_of_string_to_sql_safe_string(
+            strings=valid_list)
+
+    if valid:
+        relation = "IN"
+    else:
+        relation = "NOT IN"
+
     session_query = (
-        f"""{operator} {col} IN ({",".join(
+        f"""{operator} {col} {relation} ({",".join(
             sorted(set(map(str, valid_list))))})""")
     return session_query
 
@@ -63,3 +87,30 @@ def _sanitize_uuid_list(uuid_list: List[str]) -> List[str]:
         except ValueError:
             pass
     return sanitized_list
+
+
+def _convert_list_of_string_to_sql_safe_string(
+        strings: List[str]
+) -> List[str]:
+    """
+    Given list of string ["A", "B"]
+    converts to ["'A'", "'B'"]
+    Parameters
+    ----------
+    strings: list of strings to convert
+
+    Returns
+    -------
+    List of sql-safe strings
+    """
+    if len(strings) == 0:
+        return strings
+    if len(strings[0]) == 0:
+        return strings
+
+    # If the first element doesn't start with single quote, assume none of the
+    # elements in the list do
+    if strings[0][0] != "'":
+        # Add single quotes to each element
+        strings = [f"'{x}'" for x in strings]
+    return strings

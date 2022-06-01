@@ -1,8 +1,13 @@
 import argschema
 import pathlib
+import time
+import pandas as pd
+
+import allensdk
 
 from allensdk.brain_observatory.vbn_2022.metadata_writer.schemas import (
-    VBN2022MetadataWriterInputSchema)
+    VBN2022MetadataWriterInputSchema,
+    DataReleaseToolsInputSchema)
 
 from allensdk.brain_observatory.data_release_utils \
     .metadata_utils.id_generator import (
@@ -14,7 +19,7 @@ from allensdk.brain_observatory.data_release_utils \
 
 from allensdk.brain_observatory.vbn_2022.metadata_writer.lims_queries import (
     get_list_of_bad_probe_ids,
-    units_table_from_ecephys_session_ids,
+    units_table_from_ecephys_session_id_list,
     probes_table_from_ecephys_session_id_list,
     channels_table_from_ecephys_session_id_list,
     session_tables_from_ecephys_session_id_list)
@@ -28,8 +33,23 @@ from allensdk.internal.api import db_connection_creator
 
 class VBN2022MetadataWriterClass(argschema.ArgSchemaParser):
     default_schema = VBN2022MetadataWriterInputSchema
+    default_output_schema = DataReleaseToolsInputSchema
+
+    def write_df(
+            self,
+            df: pd.DataFrame,
+            output_path: str) -> None:
+        """
+        Write a dataframe to the specified path as a csv,
+        recording the path in self.files_written
+        """
+        df.to_csv(output_path, index=False)
+        self.files_written.append(output_path)
+        self.logger.info(f"Wrote {output_path} after "
+                         f"{time.time()-self.t0: .2e} seconds")
 
     def run(self):
+        self.t0 = time.time()
 
         file_id_generator = FileIDGenerator()
 
@@ -48,31 +68,88 @@ class VBN2022MetadataWriterClass(argschema.ArgSchemaParser):
             probe_ids_to_skip = None
 
         session_id_list = self.args['ecephys_session_id_list']
+        self.files_written = []
 
-        units_table = units_table_from_ecephys_session_ids(
+        units_table = units_table_from_ecephys_session_id_list(
                     lims_connection=lims_connection,
                     ecephys_session_id_list=session_id_list,
                     probe_ids_to_skip=probe_ids_to_skip)
-        units_table.to_csv(self.args['units_path'], index=False)
+
+        units_table = units_table[
+            ["unit_id",
+             "ecephys_channel_id",
+             "ecephys_probe_id",
+             "ecephys_session_id",
+             "amplitude_cutoff",
+             "anterior_posterior_ccf_coordinate",
+             "cumulative_drift",
+             "d_prime",
+             "dorsal_ventral_ccf_coordinate",
+             "ecephys_structure_acronym",
+             "ecephys_structure_id",
+             "firing_rate",
+             "isi_violations",
+             "isolation_distance",
+             "l_ratio",
+             "local_index",
+             "max_drift",
+             "nn_hit_rate",
+             "nn_miss_rate",
+             "presence_ratio",
+             "probe_horizontal_position",
+             "probe_vertical_position",
+             "silhouette_score",
+             "snr",
+             "valid_data",
+             "waveform_amplitude",
+             "waveform_duration",
+             "waveform_halfwidth",
+             "waveform_pt_ratio",
+             "waveform_recovery_slope",
+             "waveform_repolarization_slope",
+             "waveform_spread",
+             "waveform_velocity_above",
+             "waveform_velocity_below"]]
+
+        self.write_df(
+            df=units_table,
+            output_path=self.args['units_path'])
 
         probes_table = probes_table_from_ecephys_session_id_list(
                     lims_connection=lims_connection,
                     ecephys_session_id_list=session_id_list,
                     probe_ids_to_skip=probe_ids_to_skip)
-        probes_table.to_csv(self.args['probes_path'], index=False)
+
+        probes_table.drop(
+            labels=['temporal_subsampling_factor'],
+            axis='columns',
+            inplace=True)
+
+        self.write_df(
+            df=probes_table,
+            output_path=self.args['probes_path'])
 
         channels_table = channels_table_from_ecephys_session_id_list(
                     lims_connection=lims_connection,
                     ecephys_session_id_list=session_id_list,
                     probe_ids_to_skip=probe_ids_to_skip)
-        channels_table.to_csv(self.args['channels_path'], index=False)
+
+        channels_table.drop(
+                    labels=['ecephys_structure_id'],
+                    axis='columns',
+                    inplace=True)
+
+        self.write_df(
+            df=channels_table,
+            output_path=self.args['channels_path'])
 
         (session_table,
          behavior_session_table) = session_tables_from_ecephys_session_id_list(
                     lims_connection=lims_connection,
                     mtrain_connection=mtrain_connection,
                     ecephys_session_id_list=session_id_list,
-                    probe_ids_to_skip=probe_ids_to_skip)
+                    probe_ids_to_skip=probe_ids_to_skip,
+                    logger=self.logger)
 
         ecephys_nwb_dir = pathlib.Path(
                                 self.args['ecephys_nwb_dir'])
@@ -85,8 +162,29 @@ class VBN2022MetadataWriterClass(argschema.ArgSchemaParser):
                     index_col='ecephys_session_id',
                     on_missing_file=self.args['on_missing_file'])
 
-        session_table.to_csv(self.args['ecephys_sessions_path'],
-                             index=False)
-        behavior_session_table.to_csv(
-                             self.args['behavior_sessions_path'],
-                             index=False)
+        self.write_df(
+            df=session_table,
+            output_path=self.args['ecephys_sessions_path'])
+
+        self.write_df(
+            df=behavior_session_table,
+            output_path=self.args['behavior_sessions_path'])
+
+        pipeline_metadata = []
+        sdk_metadata = {"name": "AllenSDK",
+                        "version": str(allensdk.__version__),
+                        "comment": ""}
+        pipeline_metadata.append(sdk_metadata)
+
+        output_data = {
+            'metadata_files': self.files_written,
+            'data_pipeline_metadata': pipeline_metadata,
+            'project_name': 'visual-behavior-neuropixels',
+            'log_level': 'INFO'
+        }
+
+        self.output(output_data, indent=2)
+
+        self.logger.info(f"Wrote {self.args['ecephys_sessions_path']}\n"
+                         f"and {self.args['behavior_sessions_path']}\n"
+                         f"after {time.time()-self.t0:.2e} seconds")

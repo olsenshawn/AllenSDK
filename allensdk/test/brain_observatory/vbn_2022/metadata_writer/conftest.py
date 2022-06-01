@@ -11,9 +11,8 @@ def smoketest_config_fixture():
     config parameters for on-prem metadata writer smoketest
     """
     config = {
-      "ecephys_session_id_list": [1050962145, 1115077618, 1123100019],
-      "probes_to_skip": [{"session": 1115077618, "probe": "probeD"},
-                         {"session": 1123100019, "probe": "probeC"}]
+      "ecephys_session_id_list": [1115077618, 1081429294, 1123100019],
+      "probes_to_skip": [{"session": 1123100019, "probe": "probeC"}]
     }
     return config
 
@@ -55,6 +54,19 @@ def patching_pickle_file_fixture(
                     tempfile.mkstemp(dir=tmp_dir, suffix='.pkl')[1])
     pd.to_pickle(pkl_data, pkl_path)
     output[5813] = {'pkl_path': pkl_path,
+                    'date_of_acquisition': this_date,
+                    'session_type': this_stage}
+
+    this_date = datetime.datetime(year=1974, month=7, day=22)
+    this_stage = 'third_stage'
+    pkl_data = {'start_time': this_date,
+                'items':
+                {'behavior':
+                 {'params': {'stage': this_stage}}}}
+    pkl_path = pathlib.Path(
+                    tempfile.mkstemp(dir=tmp_dir, suffix='.pkl')[1])
+    pd.to_pickle(pkl_data, pkl_path)
+    output[2134] = {'pkl_path': pkl_path,
                     'date_of_acquisition': this_date,
                     'session_type': this_stage}
 

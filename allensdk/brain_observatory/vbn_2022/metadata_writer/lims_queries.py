@@ -1,9 +1,13 @@
 from typing import List, Tuple, Dict, Any, Optional
 import pandas as pd
+import logging
+
+from allensdk.api.queries.donors_queries import get_death_date_for_mouse_ids
 from allensdk.internal.api import PostgresQueryMixin
 
 from allensdk.internal.api.queries.utils import (
-    _sanitize_uuid_list)
+    _sanitize_uuid_list,
+    build_in_list_selector_query)
 
 from allensdk.internal.api.queries.behavior_lims_queries import (
     foraging_id_map_from_behavior_session_id)
@@ -14,14 +18,19 @@ from allensdk.internal.api.queries.compound_lims_queries import (
 from allensdk.internal.api.queries.mtrain_queries import (
     session_stage_from_foraging_id)
 
-from allensdk.brain_observatory.vbn_2022.\
+from allensdk.core.dataframe_utils import (
+    patch_df_from_other)
+
+from allensdk.brain_observatory.vbn_2022. \
     metadata_writer.dataframe_manipulations import (
         _add_prior_omissions,
         _add_session_number,
         _add_age_in_days,
         _patch_date_and_stage_from_pickle_file,
         _add_experience_level,
-        _add_images_from_behavior)
+        _add_images_from_behavior,
+        remove_aborted_sessions,
+        remove_pretest_sessions)
 
 from allensdk.brain_observatory.behavior.behavior_project_cache.tables \
     .util.prior_exposure_processing import (
@@ -79,7 +88,7 @@ def get_list_of_bad_probe_ids(
     return bad_probe_id_list
 
 
-def units_table_from_ecephys_session_ids(
+def units_table_from_ecephys_session_id_list(
         lims_connection: PostgresQueryMixin,
         ecephys_session_id_list: List[int],
         probe_ids_to_skip: Optional[List[int]]) -> pd.DataFrame:
@@ -108,6 +117,8 @@ def units_table_from_ecephys_session_ids(
         ecephys_channel_id -- int64 uniquely identifying the channel
         ecephys_probe_id -- int64 uniquely identifying the probe
         ecephys_session_id -- int64 uniquely identifying teh session
+        cluster_id -- int64
+        quality -- str
         snr -- float64
         firing_rate -- float64
         isi_violations -- float64
@@ -146,6 +157,8 @@ def units_table_from_ecephys_session_ids(
       ,ecephys_units.ecephys_channel_id
       ,ecephys_probes.id as ecephys_probe_id
       ,ecephys_sessions.id as ecephys_session_id
+      ,ecephys_units.cluster_ids as cluster_id
+      ,ecephys_units.quality as quality
       ,ecephys_units.snr
       ,ecephys_units.firing_rate
       ,ecephys_units.isi_violations
@@ -190,14 +203,19 @@ def units_table_from_ecephys_session_ids(
       ON structures.id = ecephys_channels.manual_structure_id
     """
 
-    query += f"""
-    WHERE ecephys_sessions.id IN {tuple(ecephys_session_id_list)}
-    """
+    query += build_in_list_selector_query(
+            col='ecephys_sessions.id',
+            valid_list=ecephys_session_id_list,
+            operator='WHERE',
+            valid=True)
 
     if probe_ids_to_skip is not None:
-        query += f"""
-        AND ecephys_probes.id NOT IN {tuple(probe_ids_to_skip)}
-        """
+        skip_clause = build_in_list_selector_query(
+                        col='ecephys_probes.id',
+                        valid_list=probe_ids_to_skip,
+                        operator='AND',
+                        valid=False)
+        query += f"""{skip_clause}"""
 
     units_table = lims_connection.select(query)
 
@@ -233,6 +251,7 @@ def probes_table_from_ecephys_session_id_list(
         ecephys_session_id -- int64
         name -- string like 'probeA', 'probeB', etc.
         sampling_rate -- float64
+        temporal_subsampling_factor -- float64
         lfp_sampling_rate -- float64
         phase -- float64
         has_lfp_data -- bool
@@ -248,6 +267,7 @@ def probes_table_from_ecephys_session_id_list(
       ,ecephys_probes.ecephys_session_id
       ,ecephys_probes.name
       ,ecephys_probes.global_probe_sampling_rate as sampling_rate
+      ,ecephys_probes.temporal_subsampling_factor
       ,ecephys_probes.global_probe_lfp_sampling_rate as lfp_sampling_rate
       ,ecephys_probes.phase
       ,ecephys_probes.use_lfp_data as has_lfp_data
@@ -264,15 +284,22 @@ def probes_table_from_ecephys_session_id_list(
     LEFT OUTER JOIN ecephys_units
       ON ecephys_units.ecephys_channel_id=ecephys_channels.id
     LEFT JOIN structures
-      ON structures.id = ecephys_channels.manual_structure_id"""
+      ON structures.id = ecephys_channels.manual_structure_id
+    """
 
-    query += f"""
-    WHERE ecephys_sessions.id IN {tuple(ecephys_session_id_list)}"""
+    query += build_in_list_selector_query(
+            col='ecephys_sessions.id',
+            valid_list=ecephys_session_id_list,
+            operator='WHERE',
+            valid=True)
 
     if probe_ids_to_skip is not None:
-        query += f"""
-        AND ecephys_probes.id NOT IN {tuple(probe_ids_to_skip)}
-        """
+        skip_clause = build_in_list_selector_query(
+                        col='ecephys_probes.id',
+                        valid_list=probe_ids_to_skip,
+                        operator='AND',
+                        valid=False)
+        query += f"""{skip_clause}"""
 
     query += """group by ecephys_probes.id"""
 
@@ -308,13 +335,14 @@ def channels_table_from_ecephys_session_id_list(
         ecephys_channel_id -- int64
         ecephys_probe_id -- int64
         ecephys_session_id -- int64
-        local_index -- int64
+        probe_channel_number -- int64
         probe_vertical_position -- float64
         probe_horizontal_position -- float64
         anterior_posterior_ccf_coordinate -- float64
         dorsal_ventral_ccf_coordinate -- float64
         left_right_ccf_coordinate -- float64
         ecephys_structure_acronym -- string
+        ecephys_structure_id -- int64
         unit_count -- int64 number of units on this channel
         valid_data -- a boolean indicating the validity of the channel
     """
@@ -324,13 +352,14 @@ def channels_table_from_ecephys_session_id_list(
        ecephys_channels.id as ecephys_channel_id
       ,ecephys_channels.ecephys_probe_id
       ,ecephys_sessions.id AS ecephys_session_id
-      ,ecephys_channels.local_index
+      ,ecephys_channels.local_index as probe_channel_number
       ,ecephys_channels.probe_vertical_position
       ,ecephys_channels.probe_horizontal_position
       ,ecephys_channels.anterior_posterior_ccf_coordinate
       ,ecephys_channels.dorsal_ventral_ccf_coordinate
       ,ecephys_channels.left_right_ccf_coordinate
       ,structures.acronym AS ecephys_structure_acronym
+      ,structures.id AS ecephys_structure_id
       ,COUNT(DISTINCT(ecephys_units.id)) AS unit_count
       ,ecephys_channels.valid_data as valid_data
     """
@@ -344,21 +373,29 @@ def channels_table_from_ecephys_session_id_list(
     LEFT OUTER JOIN ecephys_units
       ON ecephys_units.ecephys_channel_id=ecephys_channels.id
     LEFT JOIN structures
-      ON structures.id = ecephys_channels.manual_structure_id"""
+      ON structures.id = ecephys_channels.manual_structure_id
+    """
 
-    query += f"""
-    WHERE ecephys_sessions.id IN {tuple(ecephys_session_id_list)}"""
+    query += build_in_list_selector_query(
+            col='ecephys_sessions.id',
+            valid_list=ecephys_session_id_list,
+            operator='WHERE',
+            valid=True)
 
     if probe_ids_to_skip is not None:
-        query += f"""
-        AND ecephys_probes.id NOT IN {tuple(probe_ids_to_skip)}
-        """
+        skip_clause = build_in_list_selector_query(
+                        col='ecephys_probes.id',
+                        valid_list=probe_ids_to_skip,
+                        operator='AND',
+                        valid=False)
+        query += f"""{skip_clause}"""
 
     query += """
     GROUP BY
       ecephys_channels.id,
       ecephys_sessions.id,
-      structures.acronym"""
+      structures.acronym,
+      structures.id"""
 
     channels_table = lims_connection.select(query)
     return channels_table
@@ -393,7 +430,8 @@ def _ecephys_summary_table_from_ecephys_session_id_list(
         genotype -- tring
         sex -- string
         project_code -- string
-        age_in_days -- int
+        date_of_birth -- pd.Timestamp
+        equipment_id -- int
 
     """
     query = """
@@ -407,12 +445,11 @@ def _ecephys_summary_table_from_ecephys_session_id_list(
           ,donors.full_genotype AS genotype
           ,genders.name AS sex
           ,projects.code AS project_code
-          ,DATE_PART('day',
-            ecephys_sessions.date_of_acquisition - donors.date_of_birth)
-            AS age_in_days
+          ,donors.date_of_birth as date_of_birth
+          ,ecephys_sessions.equipment_id
         """
 
-    query += f"""
+    query += """
         FROM ecephys_sessions
         JOIN specimens
           ON specimens.id = ecephys_sessions.specimen_id
@@ -426,7 +463,13 @@ def _ecephys_summary_table_from_ecephys_session_id_list(
           ON equipment.id = ecephys_sessions.equipment_id
         LEFT OUTER JOIN behavior_sessions
           ON behavior_sessions.ecephys_session_id = ecephys_sessions.id
-        WHERE ecephys_sessions.id IN {tuple(ecephys_session_id_list)}"""
+        """
+
+    query += build_in_list_selector_query(
+            col='ecephys_sessions.id',
+            valid_list=ecephys_session_id_list,
+            operator='WHERE',
+            valid=True)
 
     summary_table = lims_connection.select(query)
     return summary_table
@@ -466,7 +509,7 @@ def _ecephys_counts_per_session_from_ecephys_session_id_list(
         channel_count -- int(the number of channels in this session)
     """
 
-    query = f"""
+    query = """
     SELECT ecephys_sessions.id as ecephys_session_id,
       COUNT(DISTINCT(ecephys_units.id)) AS unit_count,
       COUNT(DISTINCT(ecephys_probes.id)) AS probe_count,
@@ -478,13 +521,21 @@ def _ecephys_counts_per_session_from_ecephys_session_id_list(
       ecephys_channels.ecephys_probe_id = ecephys_probes.id
     LEFT OUTER JOIN ecephys_units ON
       ecephys_units.ecephys_channel_id = ecephys_channels.id
-    WHERE ecephys_sessions.id IN {tuple(ecephys_session_id_list)}
     """
 
+    query += build_in_list_selector_query(
+            col='ecephys_sessions.id',
+            valid_list=ecephys_session_id_list,
+            operator='WHERE',
+            valid=True)
+
     if probe_ids_to_skip is not None:
-        query += f"""
-        AND ecephys_probes.id NOT IN {tuple(probe_ids_to_skip)}
-        """
+        skip_clause = build_in_list_selector_query(
+                        col='ecephys_probes.id',
+                        valid_list=probe_ids_to_skip,
+                        operator='AND',
+                        valid=False)
+        query += f"""{skip_clause}"""
 
     query += """
     GROUP BY ecephys_sessions.id"""
@@ -524,7 +575,7 @@ def _ecephys_structure_acronyms_from_ecephys_session_id_list(
         ecephys_session_id -- int
         ecephys_structure_acronyms -- a list of strings
     """
-    query = f"""
+    query = """
     SELECT
       ecephys_sessions.id AS ecephys_session_id
       ,ARRAY_AGG(DISTINCT(structures.acronym)) AS ecephys_structure_acronyms
@@ -535,13 +586,21 @@ def _ecephys_structure_acronyms_from_ecephys_session_id_list(
       ON ecephys_channels.ecephys_probe_id = ecephys_probes.id
     LEFT JOIN structures
       ON structures.id = ecephys_channels.manual_structure_id
-    WHERE ecephys_sessions.id IN {tuple(ecephys_session_id_list)}
     """
 
+    query += build_in_list_selector_query(
+            col='ecephys_sessions.id',
+            valid_list=ecephys_session_id_list,
+            operator='WHERE',
+            valid=True)
+
     if probe_ids_to_skip is not None:
-        query += f"""
-        AND ecephys_probes.id NOT IN {tuple(probe_ids_to_skip)}
-        """
+        skip_clause = build_in_list_selector_query(
+                        col='ecephys_probes.id',
+                        valid_list=probe_ids_to_skip,
+                        operator='AND',
+                        valid=False)
+        query += f"""{skip_clause}"""
 
     query += """
     GROUP BY ecephys_sessions.id"""
@@ -550,10 +609,65 @@ def _ecephys_structure_acronyms_from_ecephys_session_id_list(
     return struct_tbl
 
 
+def _filter_on_death_date(
+        behavior_session_df: pd.DataFrame,
+        lims_connection: PostgresQueryMixin) -> pd.DataFrame:
+    """
+    Given a pandas dataframe of behavior sessions, remove those
+    that were recorded after the mouse's death date.
+
+    Parameters
+    ----------
+    behavior_session_df: pd.DataFrame
+
+    lims_connection: PostgresQueryMixin
+
+    Returns
+    -------
+    behavior_session_df: pd.DataFrame
+        The same as input, but with the sessions that occurred
+        after the mouse's death date dropped.
+
+    Notes
+    -----
+    This function is necessary because of a user error.
+    Sessions were loaded into LIMS with the wrong donor_id,
+    causing there to be sessions associated with some mice
+    that occur after those mice's recorded death dates. Our
+    assumption is that the error is with the donor_id rather
+    than the death date, so we can correct it by filtering
+    out any sessions that occur on mice that are supposed
+    to be dead.
+    """
+
+    behavior_session_df = behavior_session_df.merge(
+            get_death_date_for_mouse_ids(
+                lims_connections=lims_connection,
+                mouse_ids_list=behavior_session_df['mouse_id'].tolist()),
+            on='mouse_id',
+            how='left')
+
+    behavior_session_df = behavior_session_df[
+            behavior_session_df['date_of_acquisition'] <=
+            behavior_session_df['death_on']
+        ]
+
+    behavior_session_df.drop(
+        labels=['death_on'],
+        axis='columns',
+        inplace=True)
+
+    return behavior_session_df
+
+
 def _behavior_session_table_from_ecephys_session_id_list(
         lims_connection: PostgresQueryMixin,
         mtrain_connection: PostgresQueryMixin,
-        ecephys_session_id_list: List[int]) -> pd.DataFrame:
+        ecephys_session_id_list: List[int],
+        exclude_sessions_after_death_date: bool = True,
+        exclude_aborted_sessions: bool = True,
+        logger: Optional[logging.Logger] = None
+) -> pd.DataFrame:
     """
     Given a list of ecephys_session_ids, find all of the behavior_sessions
     experienced by the same mice and return a table summarizing those
@@ -568,6 +682,20 @@ def _behavior_session_table_from_ecephys_session_id_list(
     ecephys_session_id_list: List[int]
         The list of ecephys_session_ids used to lookup the mice
         we are interested in following
+
+    exclude_sessions_after_death_date
+        Whether to exclude sessions that fall after death date
+        in order to filter out these mistakenly entered sessions
+
+    exclude_aborted_sessions
+        Whether to exclude aborted sessions. The way that we determine if a
+        session is aborted is by comparing the session duration to an
+        expected duration
+
+    logger: Optional[logging.Logger]
+        Really just passed through to track progress when patching
+        columns from the pickle file, since that is the most
+        expensive process.
 
     Returns
     -------
@@ -623,9 +751,41 @@ def _behavior_session_table_from_ecephys_session_id_list(
                 on='foraging_id',
                 how='left')
 
+    # The date_of_acquisition and session_type stored in the LIMS
+    # behavior_sessions table is untrustworthy. We will set those
+    # columns to None here so that they all get patched from the
+    # pickle files.
+
+    behavior_session_df.date_of_acquisition = None
+    behavior_session_df.session_type = None
+
+    if logger is not None:
+        logger.info("Patching date_of_acquisition and session_type "
+                    "from pickle file")
+
     behavior_session_df = _patch_date_and_stage_from_pickle_file(
                              lims_connection=lims_connection,
-                             behavior_df=behavior_session_df)
+                             behavior_df=behavior_session_df,
+                             flag_columns=['date_of_acquisition',
+                                           'foraging_id',
+                                           'session_type'],
+                             logger=logger)
+
+    behavior_session_df = remove_pretest_sessions(
+            behavior_session_df=behavior_session_df)
+
+    if exclude_sessions_after_death_date:
+        # filter out any sessions which were mistakenly entered that fall
+        # after mouse death date
+        behavior_session_df = _filter_on_death_date(
+                behavior_session_df=behavior_session_df,
+                lims_connection=lims_connection)
+
+    if exclude_aborted_sessions:
+        behavior_session_df = remove_aborted_sessions(
+            lims_connection=lims_connection,
+            behavior_df=behavior_session_df
+        )
 
     behavior_session_df['image_set'] = get_image_set(
             df=behavior_session_df)
@@ -639,7 +799,8 @@ def _behavior_session_table_from_ecephys_session_id_list(
             df=behavior_session_df)
 
     behavior_session_df = _add_age_in_days(
-        df=behavior_session_df)
+        df=behavior_session_df,
+        index_column="behavior_session_id")
 
     behavior_session_df = _add_session_number(
         sessions_df=behavior_session_df,
@@ -652,7 +813,8 @@ def session_tables_from_ecephys_session_id_list(
         lims_connection: PostgresQueryMixin,
         mtrain_connection: PostgresQueryMixin,
         ecephys_session_id_list: List[int],
-        probe_ids_to_skip: Optional[List[int]]
+        probe_ids_to_skip: Optional[List[int]],
+        logger: Optional[logging.Logger] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Perform the database query to generate the ecephys_session_table
@@ -669,6 +831,11 @@ def session_tables_from_ecephys_session_id_list(
 
     probe_ids_to_skip: Optional[List[int]]
         The IDs of probes not being released
+
+    logger: Optional[logging.Logger]
+        Really just passed through to track progress
+        while patching columns from the pickle file,
+        since that is the most expensive process.
 
     Returns
     -------
@@ -720,11 +887,32 @@ def session_tables_from_ecephys_session_id_list(
     beh_table = _behavior_session_table_from_ecephys_session_id_list(
             lims_connection=lims_connection,
             mtrain_connection=mtrain_connection,
-            ecephys_session_id_list=ecephys_session_id_list)
+            ecephys_session_id_list=ecephys_session_id_list,
+            logger=logger)
 
     summary_tbl = _ecephys_summary_table_from_ecephys_session_id_list(
                         lims_connection=lims_connection,
                         ecephys_session_id_list=ecephys_session_id_list)
+
+    # patch date_of_acquisition and session_type from beh_table,
+    # which read them directly from the pickle file
+    summary_tbl = patch_df_from_other(
+                    target_df=summary_tbl,
+                    source_df=beh_table,
+                    index_column='behavior_session_id',
+                    columns_to_patch=['date_of_acquisition',
+                                      'session_type'])
+
+    # since we had to read date_of_acquisition from the pickle file,
+    # we now need to calculate age_in_days
+    summary_tbl = _add_age_in_days(
+                        df=summary_tbl,
+                        index_column="ecephys_session_id")
+
+    summary_tbl.drop(
+            labels=['date_of_birth', 'equipment_id'],
+            axis='columns',
+            inplace=True)
 
     ct_tbl = _ecephys_counts_per_session_from_ecephys_session_id_list(
                         lims_connection=lims_connection,

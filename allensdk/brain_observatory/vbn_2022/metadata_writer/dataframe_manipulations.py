@@ -2,11 +2,13 @@
 # the VBN 2022 metadata dataframes as they are directly queried
 # from LIMS.
 
-from typing import Dict
+from typing import Optional, Dict, List
 import pandas as pd
 import numpy as np
 import json
 import warnings
+import logging
+import time
 
 from allensdk.internal.api import PostgresQueryMixin
 
@@ -252,7 +254,10 @@ def _add_experience_level(
 
 def _patch_date_and_stage_from_pickle_file(
         lims_connection: PostgresQueryMixin,
-        behavior_df: pd.DataFrame) -> pd.DataFrame:
+        behavior_df: pd.DataFrame,
+        flag_columns: List[str],
+        columns_to_patch: Optional[List[str]] = None,
+        logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     """
     Fill in missing date_of_acquisition and session_type
     directly from the stimulus pickle file
@@ -264,6 +269,17 @@ def _patch_date_and_stage_from_pickle_file(
     behavior_df: pd.DataFrame
         The dataframe to be patched
 
+    flag_columns: Lis[str]
+        List of the column names which, if NULL, mark
+        a row for patching from the pickle file
+
+    columns_to_patch: Optional[List[str]]
+        List of columns to patch from the pickle file.
+        Currently only supports 'date_of_acquisition' and
+        'session_type'. If None, patch both.
+
+    logger: Optional[logging.Logger]
+
     Returns
     -------
     behavior_df: pd.DataFrame
@@ -271,54 +287,111 @@ def _patch_date_and_stage_from_pickle_file(
         date_of_acquisition or foraging_id will have their
         date_of_acquisition and session_type overwritten with
         values from the stimulus pickle file.
+
+    Note
+    ----
+    Raises ValueError if one of the columns specified in
+    flag_columns is not in the dataframe
     """
 
-    invalid_beh = behavior_df[
-            np.logical_or(
-                behavior_df.date_of_acquisition.isna(),
-                np.logical_or(
-                    behavior_df.foraging_id.isna(),
-                    behavior_df.session_type.isna()))
-    ].behavior_session_id.values
+    if columns_to_patch is None:
+        columns_to_patch = ['date_of_acquisition', 'session_type']
+    for col in columns_to_patch:
+        msg = ""
+        if col not in ('date_of_acquisition', 'session_type'):
+            msg += ("can only patch 'date_of_acquisition' "
+                    "and 'session_type'; you asked for '{col}'\n")
+        if len(msg) > 0:
+            raise ValueError(msg)
 
-    assert len(invalid_beh) == len(np.unique(invalid_beh))
+    # assemble a list that is n_rows long that is
+    # True whereever the dataframe needs to be patched
+    invalid_rows = np.zeros(len(behavior_df), dtype=bool)
+    for col_name in flag_columns:
+        if col_name not in behavior_df.columns:
+            raise ValueError("dataframe does not contain column "
+                             "{col_name}")
+        invalid_rows[behavior_df[col_name].isna()] = True
+
+    invalid_beh = behavior_df.iloc[
+            invalid_rows
+    ].behavior_session_id.values
 
     if len(invalid_beh) > 0:
         pickle_path_df = stimulus_pickle_paths_from_behavior_session_ids(
                             lims_connection=lims_connection,
-                            behavior_session_id_list=invalid_beh)
+                            behavior_session_id_list=invalid_beh.tolist())
 
-        for beh_id, pkl_path in zip(pickle_path_df.behavior_session_id,
-                                    pickle_path_df.pkl_path):
+        n_to_patch = len(pickle_path_df)
+        t0 = time.time()
+        n_to_log = max(1, n_to_patch//10)
+
+        for beh_ct, (beh_id, pkl_path) in enumerate(
+                        zip(pickle_path_df.behavior_session_id,
+                            pickle_path_df.pkl_path)):
             stim_file = BehaviorStimulusFile(filepath=pkl_path)
             new_date = stim_file.date_of_acquisition
             new_session_type = stim_file.session_type
+
+            new_vals = {'date_of_acquisition': new_date,
+                        'session_type': new_session_type}
+
+            new_row = [new_vals[c] for c in columns_to_patch]
+            if len(new_row) == 1:
+                new_row = new_row[0]
+
             behavior_df.loc[
                 behavior_df.behavior_session_id == beh_id,
-                ('date_of_acquisition', 'session_type')] = (new_date,
-                                                            new_session_type)
+                columns_to_patch] = new_row
+
+            if (beh_ct + 1) % n_to_log == 0 and logger is not None:
+                duration = time.time()-t0
+                per = duration/(beh_ct+1)
+                pred = n_to_patch*per
+                remaining = pred-duration
+                logger.info(f"Patched {beh_ct+1} of {n_to_patch} "
+                            f"in {duration:.2e} seconds; "
+                            f"predict {remaining:.2e} seconds more")
+
+    if logger is not None:
+        logger.info("Done patching from pickle file")
 
     return behavior_df
 
 
-def _add_age_in_days(df: pd.DataFrame) -> pd.DataFrame:
+def _add_age_in_days(
+        df: pd.DataFrame,
+        index_column: str) -> pd.DataFrame:
     """
     Add an 'age_in_days' column to a dataframe by subtracting
     'date_of_birth' from 'date_of_acquisition'. Return the
     dataframe with the new column added.
+
+    Parameters
+    ----------
+    df: pd.DataFrame
+
+    index_column: str
+        The column to use as an index when adding age_in_days
+        (usually "behavior_session_id" or "ecephys_session_id")
+
+    Returns
+    -------
+    df: pd.DataFrame
+        Same as input, but with age_in_days added
     """
     age_in_days = []
     for beh_id, acq, birth in zip(
-                df.behavior_session_id,
-                df.date_of_acquisition,
-                df.date_of_birth):
+                df[index_column],
+                df['date_of_acquisition'],
+                df['date_of_birth']):
         age = (acq-birth).days
-        age_in_days.append({'behavior_session_id': beh_id,
+        age_in_days.append({index_column: beh_id,
                             'age_in_days': age})
     age_in_days = pd.DataFrame(data=age_in_days)
     df = df.join(
-            age_in_days.set_index('behavior_session_id'),
-            on='behavior_session_id',
+            age_in_days.set_index(index_column),
+            on=index_column,
             how='left')
     return df
 
@@ -364,3 +437,92 @@ def _add_images_from_behavior(
             on='ecephys_session_id',
             how='left')
     return ecephys_table
+
+
+def remove_aborted_sessions(
+        lims_connection: PostgresQueryMixin,
+        behavior_df: pd.DataFrame,
+        expected_training_duration: int = 15 * 60,
+        expected_duration: int = 60 * 60
+) -> pd.DataFrame:
+    """
+    Removes aborted sessions
+
+    Parameters
+    ----------
+    lims_connection
+    behavior_df
+    expected_training_duration: Expected duration for a TRAINING_0* session
+        in seconds
+    expected_duration: Expected duration for all non-TRAINING_0* sessions
+        in seconds
+
+    Returns
+    -------
+    behavior_df: behavior df with aborted sessions filtered out
+    """
+    durations = _get_session_duration_from_behavior_session_ids(
+        lims_connection=lims_connection,
+        behavior_session_id_list=(
+            behavior_df['behavior_session_id'].unique().tolist())
+    )
+    durations = behavior_df['behavior_session_id'].map(durations)
+
+    behavior_df = behavior_df[
+        (
+            (behavior_df['session_type'].str.match('TRAINING_0.*')) &
+            (durations > expected_training_duration)
+        ) |
+        (
+            ~(behavior_df['session_type'].str.match('TRAINING_0.*')) &
+            (durations > expected_duration)
+        )
+    ]
+    return behavior_df
+
+
+def remove_pretest_sessions(
+        behavior_session_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove any sessions whose session_type begins with 'pretest_'.
+    Return the input dataframe with the removed rows.
+    """
+    new_df = behavior_session_df[
+              np.logical_not(
+                  behavior_session_df.session_type.str.startswith('pretest_'))]
+    return new_df
+
+
+def _get_session_duration_from_behavior_session_ids(
+        lims_connection: PostgresQueryMixin,
+        behavior_session_id_list: List[int]
+) -> pd.Series:
+    """
+    Gets duration in seconds for each session in `behavior_session_id_list`
+
+    Parameters
+    ----------
+    lims_connection
+    behavior_session_id_list
+
+    Returns
+    -------
+    pd.Series
+        index: behavior_session_id
+        values: duration in seconds
+    """
+    pickle_path_df = stimulus_pickle_paths_from_behavior_session_ids(
+        lims_connection=lims_connection,
+        behavior_session_id_list=behavior_session_id_list)
+    durations = []
+    for row in pickle_path_df.itertuples(index=False):
+        durations.append({
+            'behavior_session_id': row.behavior_session_id,
+            'duration': (BehaviorStimulusFile(filepath=row.pkl_path)
+                         .session_duration)
+        })
+    durations = pd.Series(
+        [x['duration'] for x in durations],
+        index=pd.Int64Index([x['behavior_session_id'] for x in durations],
+                            name='behavior_session_id'))
+    return durations
